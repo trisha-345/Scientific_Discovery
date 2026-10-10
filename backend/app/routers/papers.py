@@ -59,13 +59,12 @@ def _store_paper_with_claims(
     db.commit()
 
     # Embeddings
-    chunks = chunk_text(full_text)[:30]
+    chunks = chunk_text(full_text)[:15]
     if chunks:
-        vecs = embed_texts(chunks)
+        vecs = embed_texts(chunks)  # Keep as-is, embed_texts handles batching
         for content, v in zip(chunks, vecs):
             db.add(models.Chunk(paper_id=paper.id, content=content, embedding=v))
         db.commit()
-
     return {
         "paper_id": paper.id,
         "title": paper.title,
