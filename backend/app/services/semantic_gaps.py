@@ -1,21 +1,17 @@
 """
-Semantic gap detection using embeddings + claim structure.
+Semantic gap detection using keyword + claim structure.
 
-Replaces the crude keyword rules with:
-- Clustering of claims by embedding similarity
-- Contradiction detection via polarity mismatch
-- Under-studied combos (subject × method × population)
+NOTE: This version does NOT use embeddings (sentence-transformers).
+It's designed for memory-constrained deployments (Render free tier, 512 MB).
+Gap detection is keyword- and structure-based.
 """
-import re
 from collections import defaultdict, Counter
 from typing import List, Dict
-import numpy as np
 from sqlalchemy.orm import Session
 from app import models
-from app.services.embeddings import get_model
 
 
-# ---------- polarity lexicon (small, extend as needed) ----------
+# ---------- polarity lexicon ----------
 POSITIVE_WORDS = {
     "improve", "improved", "improves", "increase", "increased", "increases",
     "better", "enhance", "enhanced", "higher", "gain", "gains", "boost", "boosts",
@@ -24,26 +20,12 @@ POSITIVE_WORDS = {
 }
 NEGATIVE_WORDS = {
     "decrease", "decreased", "decreases", "reduce", "reduced", "reduces",
-    "worse", "lower", "harm", "harmful", "harmful", "fail", "failed", "fails",
+    "worse", "lower", "harm", "harmful", "fail", "failed", "fails",
     "ineffective", "no effect", "no significant", "not significant", "not improve",
     "not improved", "no improvement", "unhelpful", "detrimental", "negative",
     "counterproductive",
 }
 
-
-def _polarity(text: str) -> float:
-    """Return -1 (negative), 0 (neutral), +1 (positive) based on words present."""
-    t = text.lower()
-    pos = sum(1 for w in POSITIVE_WORDS if w in t)
-    neg = sum(1 for w in NEGATIVE_WORDS if w in t)
-    if pos > neg:
-        return 1.0
-    if neg > pos:
-        return -1.0
-    return 0.0
-
-
-# ---------- geography / time / method extraction ----------
 COUNTRIES = [
     "usa", "united states", "uk", "united kingdom", "china", "india", "japan",
     "germany", "france", "italy", "spain", "canada", "australia", "brazil",
@@ -54,6 +36,17 @@ TIME_HORIZONS = {
     "short": ["short-term", "immediate", "one month", "1 month", "few weeks", "short run"],
     "long":  ["long-term", "longitudinal", "follow-up", "one year", "5-year", "years later"],
 }
+
+
+def _polarity(text: str) -> float:
+    t = text.lower()
+    pos = sum(1 for w in POSITIVE_WORDS if w in t)
+    neg = sum(1 for w in NEGATIVE_WORDS if w in t)
+    if pos > neg:
+        return 1.0
+    if neg > pos:
+        return -1.0
+    return 0.0
 
 
 def _find_countries(text: str) -> List[str]:
@@ -72,14 +65,12 @@ def _find_time_horizon(text: str) -> str:
     return "unknown"
 
 
-# ---------- main detector ----------
 def detect_semantic_gaps(db: Session, project_id: int) -> List[Dict]:
-    """Return list of gap dicts (same shape as legacy detect_gaps)."""
+    """Return list of gap dicts."""
     papers = db.query(models.Paper).filter_by(project_id=project_id).all()
     if not papers:
         return []
 
-    # Gather all claims with their embeddings (paper-level)
     claims: List[models.Claim] = []
     paper_by_id = {p.id: p for p in papers}
     for p in papers:
@@ -87,102 +78,66 @@ def detect_semantic_gaps(db: Session, project_id: int) -> List[Dict]:
 
     gaps: List[Dict] = []
 
-    # ---- 1. CONTRADICTION GAP (semantic, uses embeddings) ----
-    contradiction_gap = _contradiction_gap(claims, paper_by_id)
-    if contradiction_gap:
-        gaps.append(contradiction_gap)
+    c = _contradiction_gap(claims)
+    if c:
+        gaps.append(c)
 
-    # ---- 2. POPULATION / SUBJECT GAP (under-studied subjects) ----
-    population_gap = _subject_scarcity_gap(claims, paper_by_id)
-    if population_gap:
-        gaps.append(population_gap)
+    p = _subject_scarcity_gap(claims, paper_by_id)
+    if p:
+        gaps.append(p)
 
-    # ---- 3. GEOGRAPHIC GAP ----
-    geo_gap = _geographic_gap(papers)
-    if geo_gap:
-        gaps.append(geo_gap)
+    g = _geographic_gap(papers)
+    if g:
+        gaps.append(g)
 
-    # ---- 4. TEMPORAL GAP ----
-    temporal_gap = _temporal_gap(papers)
-    if temporal_gap:
-        gaps.append(temporal_gap)
+    t = _temporal_gap(papers)
+    if t:
+        gaps.append(t)
 
-    # ---- 5. METHODOLOGICAL GAP ----
-    method_gap = _method_gap(claims, paper_by_id)
-    if method_gap:
-        gaps.append(method_gap)
+    m = _method_gap(claims, paper_by_id)
+    if m:
+        gaps.append(m)
 
-    # Assign an opportunity score to each
-    for g in gaps:
-        g["opportunity_score"] = _score_gap(g, papers)
+    for gap in gaps:
+        gap["opportunity_score"] = _score_gap(gap, papers)
 
-    # Sort by score descending
     gaps.sort(key=lambda x: -x["opportunity_score"])
-
     return gaps
 
 
 # ---------- individual detectors ----------
 
-def _contradiction_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict | None:
-    """Find pairs of claims that talk about the same thing but disagree in polarity."""
+def _contradiction_gap(claims: List[models.Claim]) -> Dict | None:
     if len(claims) < 2:
         return None
 
-    # Compute polarity for each claim
-    polarities = [(_polarity(c.text), c) for c in claims]
-    pos_claims = [c for pol, c in polarities if pol > 0]
-    neg_claims = [c for pol, c in polarities if pol < 0]
+    pos_claims = [c for c in claims if _polarity(c.text) > 0]
+    neg_claims = [c for c in claims if _polarity(c.text) < 0]
 
     if not pos_claims or not neg_claims:
         return None
 
-    # Use existing embeddings: find most similar opposite-polarity pair
-    model = get_model()
-
-    pos_texts = [c.text[:500] for c in pos_claims]
-    neg_texts = [c.text[:500] for c in neg_claims]
-
-    pos_vecs = model.encode(pos_texts, normalize_embeddings=True, show_progress_bar=False)
-    neg_vecs = model.encode(neg_texts, normalize_embeddings=True, show_progress_bar=False)
-
-    # Similarity matrix
-    sims = pos_vecs @ neg_vecs.T  # shape (n_pos, n_neg)
-
-    # Best contradictory pair
-    best_i, best_j = np.unravel_index(np.argmax(sims), sims.shape)
-    best_sim = float(sims[best_i, best_j])
-
-    # Only report if they're actually talking about the same thing
-    if best_sim < 0.45:
-        return None
-
-    c_pos = pos_claims[best_i]
-    c_neg = neg_claims[best_j]
-
-    evidence = [
-        {"paper_id": c_pos.paper_id, "claim_id": c_pos.id, "stance": "positive", "text": c_pos.text[:300]},
-        {"paper_id": c_neg.paper_id, "claim_id": c_neg.id, "stance": "negative", "text": c_neg.text[:300]},
-    ]
-
     return {
         "gap_type": "contradiction",
-        "title": f"Contradictory findings detected (semantic sim: {best_sim:.2f})",
+        "title": f"Contradictory findings detected ({len(pos_claims)} positive vs {len(neg_claims)} negative)",
         "description": (
-            f"Two papers discuss the same topic but disagree in polarity. "
-            f"Similarity: {best_sim:.2f}. Investigating moderators could resolve the disagreement."
+            "Both positive and negative claims about the same topic exist in the literature. "
+            "Investigating moderators (population, method, context) could resolve the disagreement."
         ),
-        "evidence": evidence,
-        "confidence": best_sim,
+        "evidence": [
+            {"paper_id": c.paper_id, "claim_id": c.id, "stance": "positive", "text": c.text[:200]}
+            for c in pos_claims[:3]
+        ] + [
+            {"paper_id": c.paper_id, "claim_id": c.id, "stance": "negative", "text": c.text[:200]}
+            for c in neg_claims[:3]
+        ],
     }
 
 
 def _subject_scarcity_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict | None:
-    """Find subjects that appear in very few papers (under-studied populations)."""
     if not claims:
         return None
 
-    # Group claims by normalized subject
     subject_to_papers = defaultdict(set)
     subject_to_claims = defaultdict(list)
 
@@ -199,16 +154,14 @@ def _subject_scarcity_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict
     if total_papers < 2:
         return None
 
-    # Subjects that appear in exactly 1 paper but the paper mentions ≥3 claims about it
     scarce = []
     for subj, papers_set in subject_to_papers.items():
         if len(papers_set) == 1 and len(subject_to_claims[subj]) >= 2:
-            scarce.append((subj, papers_set.pop(), subject_to_claims[subj]))
+            scarce.append((subj, list(papers_set)[0], subject_to_claims[subj]))
 
     if not scarce:
         return None
 
-    # Pick the most "central" one (longest subject name = more informative)
     scarce.sort(key=lambda x: -len(x[0]))
     subj, paper_id, clms = scarce[0]
 
@@ -227,7 +180,6 @@ def _subject_scarcity_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict
 
 
 def _geographic_gap(papers: List[models.Paper]) -> Dict | None:
-    """Detect under-represented geographic regions."""
     region_counter = Counter()
     for p in papers:
         countries = _find_countries((p.full_text or "")[:20000])
@@ -238,16 +190,13 @@ def _geographic_gap(papers: List[models.Paper]) -> Dict | None:
         return None
 
     total = sum(region_counter.values())
-    # Find the dominant region
     dominant, dom_count = region_counter.most_common(1)[0]
 
-    # Under-represented: any region mentioned < 30% of dominant
     underrepresented = [
         (r, c) for r, c in region_counter.items()
         if c < dom_count * 0.5 and r != dominant
     ]
 
-    # Or the whole geo distribution is heavily skewed
     if not underrepresented and dom_count / total > 0.6 and total >= 3:
         underrepresented = [("non-" + dominant, 0)]
 
@@ -269,7 +218,6 @@ def _geographic_gap(papers: List[models.Paper]) -> Dict | None:
 
 
 def _temporal_gap(papers: List[models.Paper]) -> Dict | None:
-    """Detect over-focus on short-term vs long-term studies."""
     counter = Counter()
     for p in papers:
         horizon = _find_time_horizon((p.full_text or "")[:20000])
@@ -297,10 +245,8 @@ def _temporal_gap(papers: List[models.Paper]) -> Dict | None:
 
 
 def _method_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict | None:
-    """Find methods that appear rarely."""
     methods = [c for c in claims if c.claim_type == "method"]
     if not methods:
-        # fallback to limitations count
         limitations = [c for c in claims if c.claim_type == "limitation"]
         if len(limitations) >= 2:
             return {
@@ -314,7 +260,6 @@ def _method_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict | None:
             }
         return None
 
-    # Group by method property
     method_counter = Counter()
     method_papers = defaultdict(set)
     for m in methods:
@@ -327,7 +272,6 @@ def _method_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict | None:
     if not method_counter:
         return None
 
-    # Rare methods used in only 1 paper
     rare = [(k, v) for k, v in method_counter.items() if len(method_papers[k]) == 1]
     if not rare:
         return None
@@ -350,12 +294,8 @@ def _method_gap(claims: List[models.Claim], paper_by_id: dict) -> Dict | None:
     }
 
 
-# ---------- scoring ----------
-
 def _score_gap(gap: Dict, papers: List[models.Paper]) -> float:
-    """Compute opportunity score 0-100 based on gap properties."""
     base = 40.0
-
     gap_type = gap.get("gap_type")
     type_bonus = {
         "contradiction": 30,
@@ -366,12 +306,7 @@ def _score_gap(gap: Dict, papers: List[models.Paper]) -> float:
     }.get(gap_type, 0)
     base += type_bonus
 
-    # Evidence count bonus
     evidence = gap.get("evidence") or []
     base += min(20.0, len(evidence) * 3)
-
-    # Contradiction confidence bonus
-    if "confidence" in gap:
-        base += gap["confidence"] * 10
 
     return min(100.0, round(base, 1))
